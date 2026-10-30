@@ -1,0 +1,19 @@
+[project]
+name = "collaborate-cwru"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "django>=6.0.1",
+    "django-cors-headers>=4.9.0",
+    "djangorestframework>=3.16.1",
+    "ollama>=0.6.1",
+    "whitenoise>=6.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "django-stubs>=5.2.9",
+    "pdoc>=16.0.0",
+]

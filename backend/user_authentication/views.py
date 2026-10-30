@@ -1,0 +1,415 @@
+"""Views for user registration, login, logout, and password/email management."""
+
+from .models import CollaboUser, EmailVerificationToken, PasswordResetToken
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError
+from django.http import HttpRequest, HttpResponse, HttpResponseBadRequest, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth import login, logout, authenticate, get_user_model
+from django.core.validators import validate_email
+from django.core.mail import send_mail
+from django.utils import timezone
+from django.conf import settings
+from datetime import timedelta
+from . import utilities
+import json
+import hashlib
+import secrets
+
+
+@csrf_exempt
+def register_user(request: HttpRequest) -> HttpResponse:
+    """Register a new user account with a CWRU email address.
+
+    Creates the account in an inactive state and sends a verification email.
+    The account cannot be used until the email link is clicked.
+
+    Args:
+        request: POST request with JSON body containing email, password,
+            first_name, and last_name.
+
+    Returns:
+        JsonResponse with success status and a redirect_url on success.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest(b"HTTP method must be POST")
+
+    json_body: dict[str, str] = dict(json.loads(request.body))
+    email = json_body.get("email")
+    password: str = json_body.get("password") or ""
+    first_name: str = json_body.get("first_name") or ""
+    last_name: str = json_body.get("last_name") or ""
+
+    if not email or not utilities.valid_case_email(email):
+        return HttpResponseBadRequest(b"Please enter a valid CWRU email")
+
+    try:
+        validate_password(password)
+        validate_email(email)
+        user = get_user_model().objects.create_user(email, email=email, password=password, first_name=first_name, last_name=last_name)
+
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+
+        raw_token = secrets.token_urlsafe(16)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        EmailVerificationToken.objects.create(
+            user=user,
+            token_hash=token_hash,
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+
+        base_url = request.build_absolute_uri('/').rstrip('/')
+        verify_link = f"{base_url}/verify-email?token={raw_token}"
+
+        send_mail(
+            subject="Verify your Collabo account",
+            message=f"Click this link to verify your email:\n\n{verify_link}",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+        )
+
+    except ValidationError:
+        return HttpResponseBadRequest(b"Invalid password")
+    except IntegrityError:
+        return HttpResponseBadRequest(b"This email already has an account")
+    except Exception:
+        return HttpResponseBadRequest(b"Failed to create user")
+
+    return JsonResponse({"success": True, "redirect_url": request.build_absolute_uri('/')})
+
+
+@csrf_exempt
+def login_user(request: HttpRequest) -> HttpResponse:
+    """Authenticate a user and start a session.
+
+    Args:
+        request: POST request with JSON body containing email and password.
+
+    Returns:
+        JsonResponse with user profile fields and session cookie on success,
+        or a 400/403 error with an error message on failure.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest(b"HTTP method must be POST")
+
+    json_body: dict[str, str] = dict(json.loads(request.body))
+    email = (json_body.get("email") or "").strip()
+    password: str = json_body.get("password") or ""
+
+    try:
+        username = CollaboUser.objects.get(email=email).username
+    except Exception:
+        return JsonResponse({"success": False, "error": "Invalid Login Credentials"}, status=400)
+
+    try:
+        u = CollaboUser.objects.get(username=username)
+        if not u.is_active:
+            return JsonResponse(
+                {"success": False, "error": "Please verify your email before logging in."},
+                status=403,
+            )
+    except CollaboUser.DoesNotExist:
+        pass
+
+    if (user := authenticate(request, username=username, password=password)) is not None:
+        login(request, user)
+
+        return JsonResponse({
+            "success": True,
+            "redirect_url": request.build_absolute_uri('/'),
+            "id": user.id,  # pyright: ignore
+            "first_name": user.first_name,  # pyright: ignore
+            "last_name": user.last_name,  # pyright: ignore
+            "username": user.username,  # pyright: ignore
+            "email": user.email,  # pyright: ignore
+            "major": user.major,  # pyright: ignore
+            "skills": user.skills,  # pyright: ignore
+            "interests": user.interests,  # pyright: ignore
+            "availability": user.availability,  # pyright: ignore
+            "preferred_contact_method": user.preferred_contact_method,  # pyright: ignore
+            "active_project_notifications": user.active_project_notifications,  # pyright: ignore
+            "project_expiration_notifications": user.project_expiration_notifications,  # pyright: ignore
+            "weekly_update_notifications": user.weekly_update_notifications,  # pyright: ignore
+            "is_staff": user.is_staff
+        })
+
+    return JsonResponse(
+        {"success": False, "error": "Invalid Login Credentials"}, status=400
+    )
+
+
+@csrf_exempt
+def whoami(request: HttpRequest) -> HttpResponse:
+    """Return the profile of the currently authenticated user.
+
+    Used on page load to restore session state in the frontend.
+
+    Args:
+        request: Any HTTP request; authentication state is checked via session.
+
+    Returns:
+        JsonResponse with full user profile if authenticated, or 401 if not.
+    """
+    if request.user.is_authenticated:
+        user = request.user
+        return JsonResponse({
+            "success": True,
+            "id": user.id,  # pyright: ignore
+            "first_name": user.first_name,  # pyright: ignore
+            "last_name": user.last_name,  # pyright: ignore
+            "username": user.username,  # pyright: ignore
+            "email": user.email,  # pyright: ignore
+            "major": user.major,  # pyright: ignore
+            "skills": user.skills,  # pyright: ignore
+            "interests": user.interests,  # pyright: ignore
+            "availability": user.availability,  # pyright: ignore
+            "preferred_contact_method": user.preferred_contact_method,  # pyright: ignore
+            "active_project_notifications": user.active_project_notifications,  # pyright: ignore
+            "project_expiration_notifications": user.project_expiration_notifications,  # pyright: ignore
+            "weekly_update_notifications": user.weekly_update_notifications,  # pyright: ignore
+            "is_staff": user.is_staff
+        })
+    return JsonResponse({"success": False}, status=401)
+
+
+@csrf_exempt
+def logout_user(request: HttpRequest) -> HttpResponse:
+    """Log out the current user and destroy their session.
+
+    Args:
+        request: Any HTTP request with an active session.
+
+    Returns:
+        JsonResponse with success: True.
+    """
+    logout(request)
+    return JsonResponse({"success": True})
+
+
+@csrf_exempt
+def verify_email(request: HttpRequest) -> HttpResponse:
+    """Activate a user account using a one-time email verification token.
+
+    Args:
+        request: POST request with JSON body containing token (str).
+
+    Returns:
+        JsonResponse with success: True on activation. Returns
+        already_verified: True if the token was already used.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest(b"HTTP method must be POST")
+
+    json_body = dict(json.loads(request.body))
+    token = (json_body.get("token") or "").strip()
+    if not token:
+        return JsonResponse({"success": False, "error": "Token required"}, status=400)
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    try:
+        rec = EmailVerificationToken.objects.select_related("user").get(token_hash=token_hash)
+    except EmailVerificationToken.DoesNotExist:
+        return JsonResponse({"success": False, "error": "Invalid token"}, status=400)
+
+    if rec.used_at is not None:
+        return JsonResponse({"success": True, "already_verified": True})
+
+    if timezone.now() >= rec.expires_at:
+        return JsonResponse({"success": False, "error": "Token expired"}, status=400)
+
+    user = rec.user
+    user.is_active = True
+    user.save(update_fields=["is_active"])
+
+    rec.used_at = timezone.now()
+    rec.save(update_fields=["used_at"])
+
+    return JsonResponse({"success": True})
+
+
+@csrf_exempt
+def resend_verification_email(request: HttpRequest) -> HttpResponse:
+    """Resend a verification email for an unverified account.
+
+    Always returns success to avoid leaking whether an email is registered.
+
+    Args:
+        request: POST request with JSON body containing email (str).
+
+    Returns:
+        JsonResponse with success: True regardless of outcome.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest(b"HTTP method must be POST")
+
+    json_body = dict(json.loads(request.body))
+    email = (json_body.get("email") or "").strip()
+
+    try:
+        user = CollaboUser.objects.get(username=email)
+        if not user.is_active:
+            EmailVerificationToken.objects.filter(user=user, used_at__isnull=True).delete()
+
+            raw_token = secrets.token_urlsafe(16)
+            token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+            EmailVerificationToken.objects.create(
+                user=user,
+                token_hash=token_hash,
+                expires_at=timezone.now() + timedelta(hours=24),
+            )
+
+            base_url = request.build_absolute_uri('/').rstrip('/')
+            verify_link = f"{base_url}/verify-email?token={raw_token}"
+
+            send_mail(
+                subject="Verify your Collabo account",
+                message=f"Click this link to verify your email:\n\n{verify_link}",
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+            )
+    except CollaboUser.DoesNotExist:
+        pass
+
+    return JsonResponse({"success": True})
+
+
+@csrf_exempt
+def forgot_password(request: HttpRequest) -> HttpResponse:
+    """Send a password-reset email for the given account.
+
+    Always returns success to avoid leaking whether an email is registered.
+
+    Args:
+        request: POST request with JSON body containing email (str).
+
+    Returns:
+        JsonResponse with success: True regardless of outcome.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest(b"HTTP method must be POST")
+
+    json_body = dict(json.loads(request.body))
+    email = (json_body.get("email") or "").strip()
+
+    try:
+        user = CollaboUser.objects.get(username=email)
+
+        raw_token = secrets.token_urlsafe(16)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+
+        PasswordResetToken.objects.create(
+            user=user,
+            token_hash=token_hash,
+            expires_at=timezone.now() + timedelta(hours=1),
+        )
+
+        reset_link = f"{request.build_absolute_uri('/').rstrip('/')}/reset-password?token={raw_token}"
+
+        send_mail(
+            subject="Reset your Collabo password",
+            message=f"Click this link to reset your password:\n\n{reset_link}\n\nThis link expires in 1 hour.",
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+        )
+    except CollaboUser.DoesNotExist:
+        pass
+
+    return JsonResponse({"success": True})
+
+
+@csrf_exempt
+def list_users(request: HttpRequest) -> HttpResponse:
+    """Return a list of all registered users. Staff only.
+
+    Args:
+        request: POST request. Must be authenticated as a staff user.
+
+    Returns:
+        JsonResponse with users list and user_count, or 401/403 on auth failure.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest(b"HTTP method must be POST")
+
+    if not request.user.is_authenticated:
+        return JsonResponse({"success": False, "error": "Authentication required"}, status=401)
+
+    if not request.user.is_staff:
+        return JsonResponse({"success": False, "error": "Admin access required"}, status=403)
+
+    users = get_user_model().objects.order_by("date_joined")
+
+    condensed_user_data = [
+        {
+            "id": u.id,
+            "username": u.username,
+            "email": u.email,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "is_staff": u.is_staff,
+            "is_active": u.is_active,
+            "date_joined": u.date_joined,
+            "major": u.major,
+            "skills": u.skills,
+        }
+        for u in users
+    ]
+
+    return JsonResponse({
+        "success": True,
+        "users": condensed_user_data,
+        "user_count": len(condensed_user_data),
+    })
+
+
+@csrf_exempt
+def reset_password(request: HttpRequest) -> HttpResponse:
+    """Reset a user's password using a one-time reset token.
+
+    Args:
+        request: POST request with JSON body containing token (str) and
+            password (str) for the new password.
+
+    Returns:
+        JsonResponse with success: True, or an error message if the token
+        is invalid/expired or the new password fails validation.
+    """
+    if request.method != "POST":
+        return HttpResponseBadRequest(b"HTTP method must be POST")
+
+    json_body = dict(json.loads(request.body))
+    token = (json_body.get("token") or "").strip()
+    new_password = json_body.get("password") or ""
+
+    if not token:
+        return JsonResponse({"success": False, "error": "Token required"}, status=400)
+
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+
+    try:
+        rec = PasswordResetToken.objects.select_related("user").get(token_hash=token_hash)
+    except PasswordResetToken.DoesNotExist:
+        return JsonResponse({"success": False, "error": "Invalid token"}, status=400)
+
+    if rec.used_at is not None:
+        return JsonResponse({"success": False, "error": "Token already used"}, status=400)
+
+    if timezone.now() >= rec.expires_at:
+        return JsonResponse({"success": False, "error": "Token expired"}, status=400)
+
+    try:
+        validate_password(new_password, user=rec.user)
+    except ValidationError as e:
+        return JsonResponse({"success": False, "error": list(e.messages)}, status=400)
+
+    rec.user.set_password(new_password)
+    rec.user.save()
+
+    rec.used_at = timezone.now()
+    rec.save(update_fields=["used_at"])
+
+    return JsonResponse({"success": True})
